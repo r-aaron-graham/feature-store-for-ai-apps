@@ -47,14 +47,16 @@ class FeatureStore:
 
     def compute_offline(self, entity_id: str, data: Dict[str, Any], ts: float) -> None:
         """Compute all features for an entity and persist them offline."""
-        cur = self.conn.cursor()
-        for feature in self.features.values():
-            value = feature.func(data, ts)
-            cur.execute(
-                "INSERT OR REPLACE INTO feature_values (entity_id, feature_name, value, timestamp) VALUES (?, ?, ?, ?)",
-                (entity_id, feature.name, value, ts),
-            )
-        self.conn.commit()
+        with self.conn:
+            for feature in self.features.values():
+                value = feature.func(data, ts)
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO feature_values "
+                    "(entity_id, feature_name, value, timestamp) VALUES (?, ?, ?, ?)",
+                    (entity_id, feature.name, value, ts),
+                )
+        for name in self.features:
+            self.online_cache.pop((entity_id, name), None)
 
     def get_offline(self, entity_id: str) -> Dict[str, Any]:
         cur = self.conn.cursor()
@@ -66,17 +68,19 @@ class FeatureStore:
         return {name: value for name, value in rows}
 
     def get_online(self, entity_id: str, ttl: float = 60.0) -> Dict[str, Any]:
-        """Retrieve feature values from the online cache, computing on miss or stale."""
+        """Retrieve cached values, falling back to SQLite or the feature function."""
         now = time.time()
         result: Dict[str, Any] = {}
+        stored = None
         for name, feature in self.features.items():
             key = (entity_id, name)
             entry = self.online_cache.get(key)
             if entry and now - entry[0] < ttl:
                 result[name] = entry[1]
                 continue
-            # Compute fresh value.  In a real system you would call a streaming computation or DB.
-            value = feature.func({}, now)
+            if stored is None:
+                stored = self.get_offline(entity_id)
+            value = stored[name] if name in stored else feature.func({}, now)
             self.online_cache[key] = (now, value)
             result[name] = value
         return result
